@@ -1,0 +1,18 @@
+# 每条忽略都要写理由 (风险接受记录)。只有一个 CloudFormation 栈，所以按规则 ID 忽略的影响范围是确定的
+
+# --- Dockerfile ---
+# AVD-DS-0026 要求 Dockerfile 写 HEALTHCHECK。运行时镜像里故意没有 curl/wget (减少攻击面)，
+# 健康检查由 ALB 的 target group 对 /health 做 (infra/lib/ads-stack.ts)，ECS 依据它替换不健康的任务
+AVD-DS-0026
+
+# --- CloudFormation (cdk.out) ---
+# ALB 用 HTTP：内部 ALB 在隔离子网里，TLS 在 API Gateway 终止；同 Checkov CKV_AWS_2 豁免，阶段 7 用 Istio mTLS
+AVD-AWS-0054
+# 任务安全组出站 443 → 0.0.0.0/0：DynamoDB/S3 Gateway Endpoint 的目的地址是 AWS 公网段，只能这么写；
+# VPC 没有 NAT/IGW，实际只能到达 VPC Endpoint。其它安全组出站都已收紧
+AVD-AWS-0104
+# RDS 备份只保留 1 天、没开删除保护：side project 删栈时要能直接删掉，避免持续扣费 (生产环境要改)
+AVD-AWS-0077
+AVD-AWS-0177
+# RDS IAM 认证：同 Checkov CKV_AWS_161 豁免，应用用 Secrets Manager 里的密码
+AVD-AWS-0176

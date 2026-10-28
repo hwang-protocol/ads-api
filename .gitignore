@@ -1,0 +1,11 @@
+build*/
+compile_commands.json
+*.db
+*.db-wal
+*.db-shm
+*.csv
+reports/
+.cache/
+.DS_Store
+node_modules/
+cdk.out/

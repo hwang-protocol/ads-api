@@ -1,0 +1,12 @@
+# 在默认规则基础上，排除生成目录 (都在 .gitignore 里，不会进仓库)
+# cdk.out 里的 S3 资源 key 是内容哈希，会被 generic-api-key 规则误报
+[extend]
+useDefault = true
+
+[allowlist]
+description = "generated / third-party directories"
+paths = [
+  '''(^|/)cdk\.out/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)build[^/]*/''',
+]

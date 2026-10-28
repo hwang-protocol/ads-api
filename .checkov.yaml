@@ -1,0 +1,6 @@
+# Checkov 配置。skip-check 里每一条都要写理由 (风险接受记录)
+framework:
+  - cloudformation
+compact: true
+quiet: true
+skip-check: []

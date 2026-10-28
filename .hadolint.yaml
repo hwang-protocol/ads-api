@@ -1,0 +1,6 @@
+# 每条忽略都要写理由 (风险接受记录)
+ignored:
+  # DL3008 要求 apt 包写死版本。Ubuntu 仓库只保留最新版本，写死后旧版本一下架构建就失败；
+  # 我们改为把基础镜像固定到 digest，并由 trivy image 扫描兜底
+  - DL3008
+failure-threshold: warning

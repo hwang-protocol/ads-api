@@ -1,0 +1,9 @@
+**/build*
+**/.cache
+**/*.db
+**/*.csv
+**/reports
+**/node_modules
+**/cdk.out
+**/.DS_Store
+compile_commands.json

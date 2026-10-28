@@ -1,0 +1,225 @@
+# DevSecOps 流水线 (阶段 1–4)：代码 → 依赖 → 镜像 → 基础设施，每一层都有安全闸门
+#
+#   secrets ─┐
+#   sast ────┤
+#   codeql ──┤  (并行，互不依赖)
+#   sca ─────┤
+#   iac ─────┤
+#   test ────┴─▶ image (构建 → 扫描 → 生成 SBOM → 只在 main 上推送并签名)
+#
+# 原则：
+#   - 所有第三方 Action 都固定到 commit SHA (tag 可以被改指向，2026-03 trivy-action 就出过这种事)
+#   - 扫描器版本固定，由 Dependabot 统一升级 (.github/dependabot.yml)
+#   - 发现问题直接让 job 失败；确认是误报或可接受的风险，写进忽略文件并注明理由
+name: devsecops
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'   # 每周一重扫：代码没变，新公布的 CVE 也能被发现
+
+permissions:
+  contents: read          # 默认只读；需要更多权限的 job 单独声明
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.21.2
+  SEMGREP_IMAGE: semgrep/semgrep:1.99.0
+  TRIVY_IMAGE: aquasec/trivy:0.57.1
+  HADOLINT_IMAGE: hadolint/hadolint:v2.12.0
+  CHECKOV_IMAGE: bridgecrew/checkov:3.2.334
+  APP: ads-api
+
+jobs:
+  # ---------- 阶段 1a: 密钥泄露 ----------
+  secrets:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0               # 扫全部历史：删掉的密钥依然留在 git 历史里
+          persist-credentials: false
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo --entrypoint sh "$GITLEAKS_IMAGE" -c \
+            'git config --global --add safe.directory /repo &&
+             gitleaks detect -s /repo --redact --no-banner --report-format sarif --report-path /repo/gitleaks.sarif'
+      - uses: github/codeql-action/upload-sarif@df409f7d9260372bd5f19e5b04e83cb3c43714ae # v3.27.9
+        if: always()
+        with: { sarif_file: gitleaks.sarif, category: gitleaks }
+
+  # ---------- 阶段 1b: SAST (规则匹配，快) ----------
+  sast:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      - name: semgrep
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$SEMGREP_IMAGE" semgrep scan \
+            --config p/c --config p/dockerfile --config p/typescript --config p/github-actions \
+            --metrics=off --error --sarif --output semgrep.sarif
+      - uses: github/codeql-action/upload-sarif@df409f7d9260372bd5f19e5b04e83cb3c43714ae # v3.27.9
+        if: always()
+        with: { sarif_file: semgrep.sarif, category: semgrep }
+
+  # ---------- 阶段 1c: SAST (数据流分析，慢但更深) ----------
+  codeql:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: javascript-typescript   # CDK 代码
+            build-mode: none
+          - language: actions                 # 工作流本身 (脚本注入、权限过大等)
+            build-mode: none
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      - uses: github/codeql-action/init@df409f7d9260372bd5f19e5b04e83cb3c43714ae # v3.27.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+      - name: build (C++ 需要真实编译，CodeQL 才能看到代码)
+        if: matrix.build-mode == 'manual'
+        env: { CXX: g++-14 }
+        run: |
+          cmake -S "$APP" -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j
+      - uses: github/codeql-action/analyze@df409f7d9260372bd5f19e5b04e83cb3c43714ae # v3.27.9
+        with: { category: '/language:${{ matrix.language }}' }
+
+  # ---------- 阶段 1d: 单元测试 + ASan/UBSan (内存安全也是安全) ----------
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      - name: build & test with sanitizers
+        env: { CXX: g++-14 }
+        run: |
+          cmake -S "$APP" -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  # ---------- 阶段 2: 依赖扫描 (SCA) ----------
+  sca:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      # npm (CDK)。C++ 第三方库在 CMake 里用 URL_HASH 固定了版本和哈希，见 docs/DEVSECOPS.md
+      - name: trivy fs
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo "$TRIVY_IMAGE" fs \
+            --scanners vuln --skip-dirs '**/node_modules' --skip-dirs '**/cdk.out' \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
+
+  # ---------- 阶段 4: 基础设施即代码 (Dockerfile + CDK) ----------
+  iac:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      - name: hadolint (Dockerfile 最佳实践)
+        run: docker run --rm -i -v "$PWD/.hadolint.yaml":/.config/hadolint.yaml "$HADOLINT_IMAGE" < "$APP/docker/Dockerfile"
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ env.APP }}/infra/package-lock.json
+      - name: cdk synth (不需要 AWS 凭证)
+        working-directory: ${{ env.APP }}/infra
+        run: |
+          npm ci --no-audit --no-fund
+          npx cdk synth -q
+      - name: checkov (CloudFormation 模板)
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo "$CHECKOV_IMAGE" \
+            --config-file .checkov.yaml \
+            -f "$APP/infra/cdk.out/AdsCampaignBudget.template.json"
+      - name: trivy config (Dockerfile + 模板)
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo "$TRIVY_IMAGE" config \
+            --skip-dirs '**/node_modules' --skip-dirs '**/cdk.out/asset.*' \
+            --severity MEDIUM,HIGH,CRITICAL --exit-code 1 .
+
+  # ---------- 阶段 3: 镜像 ----------
+  image:
+    needs: [secrets, sast, codeql, test, sca, iac]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write        # 推到 GHCR
+      id-token: write        # cosign 无密钥签名 (用 GitHub OIDC 身份，不需要保管私钥)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      - name: image name (GHCR 要求小写)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ads-api" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+      - name: build (本地加载，先扫描再决定推不推)
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          file: ${{ env.APP }}/docker/Dockerfile
+          load: true
+          tags: ads-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max   # aws-sdk-cpp 编译要 10 分钟，缓存后基本秒过
+      - name: trivy image (有修复版本的 HIGH/CRITICAL 漏洞 → 失败)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD":/repo -w /repo "$TRIVY_IMAGE" image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ads-api:ci
+      - name: SBOM (CycloneDX)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD":/repo -w /repo "$TRIVY_IMAGE" image \
+            --format cyclonedx --output sbom.cdx.json ads-api:ci
+      - uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+        with: { name: sbom, path: sbom.cdx.json }
+
+      # 以下只在 main 分支执行：通过所有闸门的镜像才会发布
+      - if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        id: push
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          file: ${{ env.APP }}/docker/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+      - if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+      - name: sign + attest SBOM (按 digest 签名，tag 可变、digest 不可变)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$REF"
