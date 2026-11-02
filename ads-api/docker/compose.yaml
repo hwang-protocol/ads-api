@@ -1,0 +1,59 @@
+# 本地环境: DynamoDB Local + PostgreSQL + 两个 ads_api 实例 (验证多实例共享预算不超支)
+#   docker compose -f ads-api/docker/compose.yaml up --build -d
+#   python3 ads-api/tests/integration_test.py http://localhost:8080 http://localhost:8081
+#   docker compose -f ads-api/docker/compose.yaml run --rm bench
+#   docker compose -f ads-api/docker/compose.yaml down
+name: ads-local
+
+x-api-env: &api-env
+  TABLE_NAME: ads
+  AWS_REGION: us-east-1
+  DDB_ENDPOINT: http://dynamodb:8000
+  AWS_ACCESS_KEY_ID: local          # DynamoDB Local 不校验密钥，但 SDK 要求有
+  AWS_SECRET_ACCESS_KEY: local
+  AWS_EC2_METADATA_DISABLED: "true" # 不要去找 EC2 元数据服务 (本地没有，会卡几秒超时)
+  PGHOST: postgres
+  PGUSER: ads
+  PGPASSWORD: ads
+  PGDATABASE: ads
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["8000:8000"]
+
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: ads
+      POSTGRES_PASSWORD: ads
+      POSTGRES_DB: ads
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ads"]
+      interval: 2s
+      retries: 20
+
+  api1: &api
+    build:
+      context: ../..
+      dockerfile: ads-api/docker/Dockerfile
+    image: ads-api:local
+    environment: *api-env
+    ports: ["8080:8080"]
+    depends_on:
+      dynamodb: { condition: service_started }
+      postgres: { condition: service_healthy }
+    stop_grace_period: 10s   # SIGTERM 后给 10 秒把预算租约还回去
+
+  api2:
+    <<: *api
+    ports: ["8081:8080"]
+
+  bench:
+    image: ads-api:local
+    profiles: ["bench"]        # 默认不启动，用 docker compose run bench 跑
+    environment: *api-env
+    entrypoint: ["budget_bench", "--store", "dynamo"]
+    depends_on: [dynamodb]
