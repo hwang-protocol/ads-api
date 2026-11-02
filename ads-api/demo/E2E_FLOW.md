@@ -3,7 +3,7 @@
 想**亲眼看**的话，直接跑：
 
 ```bash
-cd DecSecOpsRepo   # 仓库根目录
+cd ads-api   # 仓库根目录
 ads-api/demo/e2e_demo.sh          # 每一步停下来，按回车继续
 ads-api/demo/e2e_demo.sh --no-pause
 ```

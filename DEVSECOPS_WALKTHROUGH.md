@@ -313,7 +313,7 @@ workflow 默认只给 `contents: read`，哪个 job 需要更多权限，就单�
 只需要 Docker，不用安装任何扫描器。
 
 ```bash
-cd DecSecOpsRepo
+cd ads-api   # 仓库根目录
 
 # 全部跑一遍
 # (第一次要编译 aws-sdk-cpp，大约 15 分钟)
