@@ -5,7 +5,7 @@
 # 本地: docker compose -f ads-api/docker/compose.yaml up --build
 # AWS : CDK 的 DockerImageAsset 用同一个 Dockerfile 构建镜像推到 ECR，跑在 Fargate (ARM64)
 
-FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c AS sdk
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS sdk
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       g++-14 cmake ninja-build git ca-certificates curl \
@@ -32,7 +32,7 @@ RUN cmake -S ads-api -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
  && cmake --build /build \
  && ctest --test-dir /build --output-on-failure
 
-FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c AS runtime
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS runtime
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libcurl4t64 libssl3t64 zlib1g libpq5 ca-certificates \
